@@ -1,0 +1,1012 @@
+As content becomes more and more freely available, it has become kind of a full time job to identify what to watch next. The streaming services have their own recommendation algorigthms but they work in silos.
+
+In this article we are going to build a bare bones recommendation system using Qdrant vector search. We will be using semantic similarity to find movie recommendations.
+
+_Disclaimer: I am no expert in AI, recommendation systems or vector databases. This post is an experiment to move towards that point in this high dimensional vector space._
+
+If you would like to follow along you can use the notebook from this github repo.
+
+# Installing ipywidgets
+
+**You can skip this section if you are running on google collab.**
+
+I had to restart the jupyter kernel to get ipywidgets to work. It's better to do that now instead of doing that later and loosing all the progress.
+
+```python
+# Install
+%pip install ipywidgets
+```
+
+Let's see if `ipywidgets` is available. You should be able to see a slider when you run the next cell. It didn't work for me right away. I had to restart the jupyter kernel to get it to work.
+
+```python
+import ipywidgets as widgets
+widgets.IntSlider()
+```
+
+    IntSlider(value=0)
+
+# Fetch the data from TMDB
+
+First, we need some data on movies and tv series. [TMDB provides an API](https://developer.themoviedb.org/reference/intro/getting-started) that would be perfect for this.
+
+We need an API key to access the data from TMDB. If you would like to follow along, [head over to TMDB now](https://developer.themoviedb.org/v4/reference/intro/getting-started) to create an API key.
+
+```python
+# Update this with your api key
+import os
+os.environ["TMDB_API_KEY"] = ""
+```
+
+We are going to fetch the top rated movies and the top rated tv series from TMDB. We have to fetch the data from 2 different endpoints for that.
+
+- https://api.themoviedb.org/3/movie/top_rated
+- https://api.themoviedb.org/3/tv/top_rated
+
+Like most APIs the data provided by TMDB is paginated. Let's write a function to fetch the data for specific page.
+
+```python
+import requests
+import json
+
+def fetch_titles_for_page(title_type, page):
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Bearer {os.getenv('TMDB_API_KEY')}",
+    }
+
+    url = f"https://api.themoviedb.org/3/{title_type}/top_rated?language=en-US&page={page}"
+    response = requests.get(url, headers=headers)
+    response_text = response.text
+    response_json = json.loads(response_text)
+    return {
+        "titles": response_json["results"],
+        "total_pages": response_json["total_pages"],
+    }
+```
+
+Let's try this for a page of movies
+
+```python
+import pprint
+response = fetch_titles_for_page("tv", 1)
+print(len(response["titles"]), response["total_pages"])
+pprint.pp(response["titles"][0])
+```
+
+    20 102
+    {'adult': False,
+     'backdrop_path': '/9faGSFi5jam6pDWGNd0p8JcJgXQ.jpg',
+     'genre_ids': [18, 80],
+     'id': 1396,
+     'origin_country': ['US'],
+     'original_language': 'en',
+     'original_name': 'Breaking Bad',
+     'overview': 'Walter White, a New Mexico chemistry teacher, is diagnosed with '
+                 'Stage III cancer and given a prognosis of only two years left to '
+                 'live. He becomes filled with a sense of fearlessness and an '
+                 "unrelenting desire to secure his family's financial future at "
+                 'any cost as he enters the dangerous world of drugs and crime.',
+     'popularity': 547.234,
+     'poster_path': '/ztkUQFLlC19CCMYHW9o1zWhJRNq.jpg',
+     'first_air_date': '2008-01-20',
+     'name': 'Breaking Bad',
+     'vote_average': 8.913,
+     'vote_count': 14017}
+
+Now, we are ready to write a function that would take a title type, fetch the data from all the pages and write it to a jsonl file. We are storing the data as json lines so that we can read and write individual titles without deserializing all the titles everytime.
+
+Let's create a data directory in our root folder. You can do this in google collab using the file explorer or using the code below.
+
+```python
+from pathlib import Path
+Path("./data").mkdir(exist_ok=True)
+```
+
+Let's do a quick check to see if our directory has been created in the correct spot
+
+```python
+with open("./data/test.jsonl", "a") as fh:
+  json.dump([1, 2, 3], fh)
+  fh.write("\n")
+```
+
+We are now ready to fetch all the titles. Let's write the function for that.
+
+```python
+import time
+
+def fetch_top_rated_titles(title_type):
+  page = 1
+  total_pages = 1 # We don't know the total number of pages yet, so we start with 1
+
+  while page <= total_pages:
+    response = fetch_titles_for_page(title_type, page)
+    if len(response["titles"]) != 0:
+      total_pages = response["total_pages"]
+      with open("data/top-titles.jsonl", "a") as fh:
+        for title in response["titles"]:
+          # TMDB has different field names for movies and tv series
+          # We will use a common name for both
+          if title.get("title") is not None:
+            title["name"] = title.get("title")
+            del title["title"]
+
+          if title.get("original_title") is not None:
+            title["original_name"] = title.get("original_title")
+            del title["original_title"]
+
+          # We are parsing the release year from the date
+          if title.get("release_date") is not None:
+            title["release_year"] = int(title.get("release_date").split("-")[0])
+          elif title.get("first_air_date") is not None:
+            title["release_year"] = int(title.get("first_air_date").split("-")[0])
+
+          title["type"] = title_type
+          json.dump(title, fh)
+          fh.write("\n")
+      page += 1
+      time.sleep(0.1)
+```
+
+```python
+# Fetch all top rated movies
+# This would take a few minutes as we are fetching close to 10,000 movies
+fetch_top_rated_titles(title_type="movie")
+```
+
+```python
+# Fetch all top rated tv series
+fetch_top_rated_titles(title_type="tv")
+```
+
+We have saved all the movies and all the tv series in our json file. Let's write a function that would make it easier to read them whenever needed.
+
+**Note: If you are running this in a cloud environment it would be best to download the json file to your local machine otherwise you might lose it if the session ends.**
+
+```python
+import json
+
+# We will store all the titles in a cache to avoid loading it everytime we need a title
+_titles = []
+def load_titles_from_disk():
+    global _titles
+
+    # If we have already loaded the titles from disk, return them directly
+    if len(_titles) > 0:
+        return _titles
+
+    # Load the titles from disk and save them to the cache
+    file_path = "./data/top-titles.jsonl"
+    with open(file_path, "r") as fh:
+        for line in fh:
+            title = json.loads(line)
+            _titles.append(title)
+
+    return _titles
+```
+
+Now that we have all the titles ready and loaded, let's do a (shallow) dive into Qdrant.
+
+# Qdrant Vector DB
+
+Qdrant is an open source vector database purpose built for performance. Qdrant is built in rust, a language all new performance oriented things should be built in.
+
+## What exactly is a vector database?
+
+A vector database allows us to find approximate nearest neighbors of a given vector. Along with this core capability it allows us to filter the vectors by all sorts of metadata.
+
+## But, what is a vector?
+
+A vector is just an array of floats. The reason why vectors are so popular now is mainly because of embeddings. Embeddings are a way to represent data in such a way that semantically similar things are closer to each other in the vector space.
+
+We can create embeddings out of all sorts of data like text, images, sounds, etc.
+
+Let's install Qdrant python client. The python client has a fully functional local client that would work greate for out purpose. We will also install the Fastembed library from Qdrant. This will allow us to create embeddings for out titles (Movies and TV series) without installing any additional dependencies.
+
+```python
+%pip install "qdrant-client[fastembed]"
+```
+
+    huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...
+    To disable this warning, you can either:
+    	- Avoid using `tokenizers` before the fork if possible
+    	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
+
+
+    Requirement already satisfied: qdrant-client[fastembed] in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (1.10.1)
+    Requirement already satisfied: fastembed==0.2.7 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from qdrant-client[fastembed]) (0.2.7)
+    Requirement already satisfied: grpcio>=1.41.0 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from qdrant-client[fastembed]) (1.65.4)
+    Requirement already satisfied: grpcio-tools>=1.41.0 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from qdrant-client[fastembed]) (1.65.4)
+    Requirement already satisfied: httpx>=0.20.0 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from httpx[http2]>=0.20.0->qdrant-client[fastembed]) (0.27.0)
+    Requirement already satisfied: numpy>=1.26 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from qdrant-client[fastembed]) (1.26.4)
+    Requirement already satisfied: portalocker<3.0.0,>=2.7.0 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from qdrant-client[fastembed]) (2.10.1)
+    Requirement already satisfied: pydantic>=1.10.8 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from qdrant-client[fastembed]) (2.8.2)
+    Requirement already satisfied: urllib3<3,>=1.26.14 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from qdrant-client[fastembed]) (2.2.2)
+    Requirement already satisfied: huggingface-hub<0.21,>=0.20 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from fastembed==0.2.7->qdrant-client[fastembed]) (0.20.3)
+    Requirement already satisfied: loguru<0.8.0,>=0.7.2 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from fastembed==0.2.7->qdrant-client[fastembed]) (0.7.2)
+    Requirement already satisfied: onnx<2.0.0,>=1.15.0 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from fastembed==0.2.7->qdrant-client[fastembed]) (1.16.2)
+    Requirement already satisfied: onnxruntime<2.0.0,>=1.17.0 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from fastembed==0.2.7->qdrant-client[fastembed]) (1.18.1)
+    Requirement already satisfied: requests<3.0,>=2.31 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from fastembed==0.2.7->qdrant-client[fastembed]) (2.32.3)
+    Requirement already satisfied: tokenizers<0.16,>=0.15 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from fastembed==0.2.7->qdrant-client[fastembed]) (0.15.2)
+    Requirement already satisfied: tqdm<5.0,>=4.66 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from fastembed==0.2.7->qdrant-client[fastembed]) (4.66.5)
+    Requirement already satisfied: protobuf<6.0dev,>=5.26.1 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from grpcio-tools>=1.41.0->qdrant-client[fastembed]) (5.27.3)
+    Requirement already satisfied: setuptools in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from grpcio-tools>=1.41.0->qdrant-client[fastembed]) (72.1.0)
+    Requirement already satisfied: anyio in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from httpx>=0.20.0->httpx[http2]>=0.20.0->qdrant-client[fastembed]) (4.4.0)
+    Requirement already satisfied: certifi in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from httpx>=0.20.0->httpx[http2]>=0.20.0->qdrant-client[fastembed]) (2024.7.4)
+    Requirement already satisfied: httpcore==1.* in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from httpx>=0.20.0->httpx[http2]>=0.20.0->qdrant-client[fastembed]) (1.0.5)
+    Requirement already satisfied: idna in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from httpx>=0.20.0->httpx[http2]>=0.20.0->qdrant-client[fastembed]) (3.7)
+    Requirement already satisfied: sniffio in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from httpx>=0.20.0->httpx[http2]>=0.20.0->qdrant-client[fastembed]) (1.3.1)
+    Requirement already satisfied: h11<0.15,>=0.13 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from httpcore==1.*->httpx>=0.20.0->httpx[http2]>=0.20.0->qdrant-client[fastembed]) (0.14.0)
+    Requirement already satisfied: h2<5,>=3 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from httpx[http2]>=0.20.0->qdrant-client[fastembed]) (4.1.0)
+    Requirement already satisfied: annotated-types>=0.4.0 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from pydantic>=1.10.8->qdrant-client[fastembed]) (0.7.0)
+    Requirement already satisfied: pydantic-core==2.20.1 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from pydantic>=1.10.8->qdrant-client[fastembed]) (2.20.1)
+    Requirement already satisfied: typing-extensions>=4.6.1 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from pydantic>=1.10.8->qdrant-client[fastembed]) (4.12.2)
+    Requirement already satisfied: hyperframe<7,>=6.0 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from h2<5,>=3->httpx[http2]>=0.20.0->qdrant-client[fastembed]) (6.0.1)
+    Requirement already satisfied: hpack<5,>=4.0 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from h2<5,>=3->httpx[http2]>=0.20.0->qdrant-client[fastembed]) (4.0.0)
+    Requirement already satisfied: filelock in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from huggingface-hub<0.21,>=0.20->fastembed==0.2.7->qdrant-client[fastembed]) (3.15.4)
+    Requirement already satisfied: fsspec>=2023.5.0 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from huggingface-hub<0.21,>=0.20->fastembed==0.2.7->qdrant-client[fastembed]) (2024.6.1)
+    Requirement already satisfied: pyyaml>=5.1 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from huggingface-hub<0.21,>=0.20->fastembed==0.2.7->qdrant-client[fastembed]) (6.0.2)
+    Requirement already satisfied: packaging>=20.9 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from huggingface-hub<0.21,>=0.20->fastembed==0.2.7->qdrant-client[fastembed]) (24.1)
+    Requirement already satisfied: coloredlogs in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from onnxruntime<2.0.0,>=1.17.0->fastembed==0.2.7->qdrant-client[fastembed]) (15.0.1)
+    Requirement already satisfied: flatbuffers in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from onnxruntime<2.0.0,>=1.17.0->fastembed==0.2.7->qdrant-client[fastembed]) (24.3.25)
+    Requirement already satisfied: sympy in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from onnxruntime<2.0.0,>=1.17.0->fastembed==0.2.7->qdrant-client[fastembed]) (1.13.2)
+    Requirement already satisfied: charset-normalizer<4,>=2 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from requests<3.0,>=2.31->fastembed==0.2.7->qdrant-client[fastembed]) (3.3.2)
+    Requirement already satisfied: humanfriendly>=9.1 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from coloredlogs->onnxruntime<2.0.0,>=1.17.0->fastembed==0.2.7->qdrant-client[fastembed]) (10.0)
+    Requirement already satisfied: mpmath<1.4,>=1.1.0 in /Users/h/Developer/experiments/timble/venv/lib/python3.12/site-packages (from sympy->onnxruntime<2.0.0,>=1.17.0->fastembed==0.2.7->qdrant-client[fastembed]) (1.3.0)
+
+    [1m[[0m[34;49mnotice[0m[1;39;49m][0m[39;49m A new release of pip is available: [0m[31;49m24.0[0m[39;49m -> [0m[32;49m24.2[0m
+    [1m[[0m[34;49mnotice[0m[1;39;49m][0m[39;49m To update, run: [0m[32;49mpip install --upgrade pip[0m
+    Note: you may need to restart the kernel to use updated packages.
+
+# Data Exploration
+
+A quick look at the data shows we have a few fields of interest
+
+```python
+import pprint
+
+titles = load_titles_from_disk()
+pprint.pp(titles[0])
+```
+
+    {'adult': False,
+     'backdrop_path': '/avedvodAZUcwqevBfm8p4G2NziQ.jpg',
+     'genre_ids': [18, 80],
+     'id': 278,
+     'original_language': 'en',
+     'overview': 'Imprisoned in the 1940s for the double murder of his wife and '
+                 'her lover, upstanding banker Andy Dufresne begins a new life at '
+                 'the Shawshank prison, where he puts his accounting skills to '
+                 'work for an amoral warden. During his long stretch in prison, '
+                 'Dufresne comes to be admired by the other inmates -- including '
+                 'an older prisoner named Red -- for his integrity and '
+                 'unquenchable sense of hope.',
+     'popularity': 162.491,
+     'poster_path': '/9cqNxx0GxF0bflZmeSMuL5tnGzr.jpg',
+     'release_date': '1994-09-23',
+     'video': False,
+     'vote_average': 8.705,
+     'vote_count': 26660,
+     'name': 'The Shawshank Redemption',
+     'original_name': 'The Shawshank Redemption',
+     'release_year': 1994,
+     'type': 'movie'}
+
+The `overview` field tells us what the title is about. The `name` field tells us about.. well, the name of the title.
+
+We will format our titles in the following structure
+
+{original_name} is a {title_type} released on {release_data} with the following overview - {overview}
+
+Let's create a function for that.
+
+```python
+def get_formatted_title(title):
+  formatted_string = ""
+  title_type = title.get("type") if title.get("type") == "movie" else "tv series"
+  if title.get("name") is not None:
+    formatted_string += f"{title.get("name")} is a {title_type}"
+  if title.get("release_year") is not None:
+    formatted_string += f" released in {title.get("release_year")}"
+  if title.get("overview") is not None:
+    formatted_string += f" with the following overview - {title.get("overview")}"
+
+  return formatted_string
+```
+
+```python
+get_formatted_title(titles[0])
+```
+
+    'The Shawshank Redemption is a movie released in 1994 with the following overview - Imprisoned in the 1940s for the double murder of his wife and her lover, upstanding banker Andy Dufresne begins a new life at the Shawshank prison, where he puts his accounting skills to work for an amoral warden. During his long stretch in prison, Dufresne comes to be admired by the other inmates -- including an older prisoner named Red -- for his integrity and unquenchable sense of hope.'
+
+```python
+get_formatted_title(titles[-1])
+```
+
+    'Velma is a tv series released in 2023 with the following overview - Jinkies! This raucous reimagining of the Scooby-Doo franchise unravels the mysterious origins of Mystery, Inc. – as seen through the eyes of the gang’s beloved bespectacled detective Velma.'
+
+We perform some basic sanity checks and return the formatted string. We will now create vector embeddings for these strings and store them in a qdrant collection.
+
+## Qdrant + Fastembed
+
+Qdrant along with Fastembed provides a super quick way to embed our documents. We can start by creating a client. We will be using the qdrant cloud. Qdrant's free tier should be enough for our liitle experiment and we can easily upgrade if we want to.
+
+If you dont have one already. Head over to [https://cloud.qdrant.io/](https://cloud.qdrant.io/) to create your free cluster.
+
+Once you have created a new cluster we will need the API key and the cluster url from the dashboard.
+
+![Cluster Url](./images/cluster-url.png "Cluster Url")
+
+![API Key](./images/api-key.png "API Key")
+
+```python
+import os
+os.environ["QDRANT_API_KEY"] = ""
+os.environ["QDRANT_CLUSTER_URL"] = ""
+```
+
+```python
+from qdrant_client import QdrantClient
+
+_client = None
+def get_client():
+    global _client
+    if _client is not None:
+        return _client
+    _client = QdrantClient(
+        url=os.getenv("QDRANT_CLUSTER_URL"),
+        api_key=os.getenv("QDRANT_API_KEY"))
+    return _client
+```
+
+Fastembed provides multiple ways to manage embeddings. You can interact directly with the embedding generator or use a helper method like `client.add()`.
+
+Let's try the direct method first.
+
+```python
+from fastembed import TextEmbedding
+
+# This will trigger the defautl model download and initialization
+embedding_model = TextEmbedding()
+print("The model BAAI/bge-small-en-v1.5 is ready to use.")
+```
+
+    Fetching 5 files:   0%|          | 0/5 [00:00<?, ?it/s]
+
+
+    The model BAAI/bge-small-en-v1.5 is ready to use.
+
+```python
+documents = [get_formatted_title(titles[i]) for i in range(2)]
+embeddings_generator = embedding_model.embed(documents)
+embeddings_list = list(embeddings_generator)
+print("Embedding length - ", len(embeddings_list[0]))
+print("First 5 dimensions of vector 0 - ", embeddings_list[0][:5])
+print("First 5 dimensions of vector 1 - ", embeddings_list[1][:5])
+```
+
+    Embedding length -  384
+    First 5 dimensions of vector 0 -  [-0.05396069  0.03002024 -0.07872865  0.00048775  0.02766631]
+    First 5 dimensions of vector 1 -  [-0.03963627  0.06695076 -0.03377489  0.04049916 -0.01512619]
+
+We are also going to store some metadata along with out
+
+`client.add()` helper method takes care of managing the embedding model for us. We can just pass in the documents along with some optional metadata and ids and be done with it.
+
+Let's try that now.
+First we will write a function that seperates out the formatted strings, the metadata and the ids for all the titles. If your data does not have ids qdrant can generate uuids automatically.
+
+```python
+def get_metadata_from_title(title):
+    return {
+        "name": title.get("name"),
+        "type": title.get("type"),
+        "vote_average": title.get("vote_average"),
+        "vote_count": title.get("vote_count"),
+        "release_year": title.get("release_year"),
+        "backdrop_path": title.get("backdrop_path"),
+        "poster_path": title.get("poster_path"),
+    }
+
+def get_prepared_titles(titles):
+    docs = []
+    metadata = []
+    ids = []
+    for title in titles:
+        if title.get("name") and title.get("overview"):
+            docs.append(get_formatted_title(title))
+            metadata.append(get_metadata_from_title(title))
+            ids.append(title["id"])
+    return docs, metadata, ids
+```
+
+Next we will use `client.add()` to embed and store our documents.
+
+```python
+COLLECTION_NAME = "titles_v1"
+
+def embed_titles(limit=None):
+    titles = load_titles_from_disk()
+    docs, metadata, ids = get_prepared_titles(titles[:limit] if limit else titles)
+    client = get_client()
+    client.add(
+        collection_name=COLLECTION_NAME, documents=docs, metadata=metadata, ids=ids
+    )
+
+    return client.count(COLLECTION_NAME)
+
+```
+
+Let's embed 10 titles first.
+
+```python
+embed_titles(limit=10)
+```
+
+    CountResult(count=10)
+
+Let's try to find a movie and see if the embedding worked.
+
+```python
+titles = load_titles_from_disk()
+client = get_client()
+client.query(
+    collection_name=COLLECTION_NAME,
+    query_text=get_formatted_title(titles[1]),
+    limit=5
+)
+```
+
+    [QueryResponse(id=238, embedding=None, sparse_embedding=None, metadata={'document': 'The Godfather is a movie released in 1972 with the following overview - Spanning the years 1945 to 1955, a chronicle of the fictional Italian-American Corleone crime family. When organized crime family patriarch, Vito Corleone barely survives an attempt on his life, his youngest son, Michael steps in to take care of the would-be killers, launching a campaign of bloody revenge.', 'name': 'The Godfather', 'type': 'movie', 'vote_average': 8.69, 'vote_count': 20222, 'release_year': 1972, 'backdrop_path': '/tmU7GeKVybMWFButWEGl2M4GeiP.jpg', 'poster_path': '/3bhkrj58Vtu7enYsRolD1fZdja1.jpg'}, document='The Godfather is a movie released in 1972 with the following overview - Spanning the years 1945 to 1955, a chronicle of the fictional Italian-American Corleone crime family. When organized crime family patriarch, Vito Corleone barely survives an attempt on his life, his youngest son, Michael steps in to take care of the would-be killers, launching a campaign of bloody revenge.', score=1.0),
+     QueryResponse(id=240, embedding=None, sparse_embedding=None, metadata={'document': 'The Godfather Part II is a movie released in 1974 with the following overview - In the continuing saga of the Corleone crime family, a young Vito Corleone grows up in Sicily and in 1910s New York. In the 1950s, Michael Corleone attempts to expand the family business into Las Vegas, Hollywood and Cuba.', 'name': 'The Godfather Part II', 'type': 'movie', 'vote_average': 8.574, 'vote_count': 12202, 'release_year': 1974, 'backdrop_path': '/kGzFbGhp99zva6oZODW5atUtnqi.jpg', 'poster_path': '/hek3koDUyRQk7FIhPXsa6mT2Zc3.jpg'}, document='The Godfather Part II is a movie released in 1974 with the following overview - In the continuing saga of the Corleone crime family, a young Vito Corleone grows up in Sicily and in 1910s New York. In the 1950s, Michael Corleone attempts to expand the family business into Las Vegas, Hollywood and Cuba.', score=0.92699754),
+     QueryResponse(id=155, embedding=None, sparse_embedding=None, metadata={'document': 'The Dark Knight is a movie released in 2008 with the following overview - Batman raises the stakes in his war on crime. With the help of Lt. Jim Gordon and District Attorney Harvey Dent, Batman sets out to dismantle the remaining criminal organizations that plague the streets. The partnership proves to be effective, but they soon find themselves prey to a reign of chaos unleashed by a rising criminal mastermind known to the terrified citizens of Gotham as the Joker.', 'name': 'The Dark Knight', 'type': 'movie', 'vote_average': 8.516, 'vote_count': 32393, 'release_year': 2008, 'backdrop_path': '/dqK9Hag1054tghRQSqLSfrkvQnA.jpg', 'poster_path': '/qJ2tW6WMUDux911r6m7haRef0WH.jpg'}, document='The Dark Knight is a movie released in 2008 with the following overview - Batman raises the stakes in his war on crime. With the help of Lt. Jim Gordon and District Attorney Harvey Dent, Batman sets out to dismantle the remaining criminal organizations that plague the streets. The partnership proves to be effective, but they soon find themselves prey to a reign of chaos unleashed by a rising criminal mastermind known to the terrified citizens of Gotham as the Joker.', score=0.84304106),
+     QueryResponse(id=389, embedding=None, sparse_embedding=None, metadata={'document': "12 Angry Men is a movie released in 1957 with the following overview - The defense and the prosecution have rested and the jury is filing into the jury room to decide if a young Spanish-American is guilty or innocent of murdering his father. What begins as an open and shut case soon becomes a mini-drama of each of the jurors' prejudices and preconceptions about the trial, the accused, and each other.", 'name': '12 Angry Men', 'type': 'movie', 'vote_average': 8.543, 'vote_count': 8451, 'release_year': 1957, 'backdrop_path': '/qqHQsStV6exghCM7zbObuYBiYxw.jpg', 'poster_path': '/ow3wq89wM8qd5X7hWKxiRfsFf9C.jpg'}, document="12 Angry Men is a movie released in 1957 with the following overview - The defense and the prosecution have rested and the jury is filing into the jury room to decide if a young Spanish-American is guilty or innocent of murdering his father. What begins as an open and shut case soon becomes a mini-drama of each of the jurors' prejudices and preconceptions about the trial, the accused, and each other.", score=0.8360134),
+     QueryResponse(id=278, embedding=None, sparse_embedding=None, metadata={'document': 'The Shawshank Redemption is a movie released in 1994 with the following overview - Imprisoned in the 1940s for the double murder of his wife and her lover, upstanding banker Andy Dufresne begins a new life at the Shawshank prison, where he puts his accounting skills to work for an amoral warden. During his long stretch in prison, Dufresne comes to be admired by the other inmates -- including an older prisoner named Red -- for his integrity and unquenchable sense of hope.', 'name': 'The Shawshank Redemption', 'type': 'movie', 'vote_average': 8.705, 'vote_count': 26660, 'release_year': 1994, 'backdrop_path': '/avedvodAZUcwqevBfm8p4G2NziQ.jpg', 'poster_path': '/9cqNxx0GxF0bflZmeSMuL5tnGzr.jpg'}, document='The Shawshank Redemption is a movie released in 1994 with the following overview - Imprisoned in the 1940s for the double murder of his wife and her lover, upstanding banker Andy Dufresne begins a new life at the Shawshank prison, where he puts his accounting skills to work for an amoral warden. During his long stretch in prison, Dufresne comes to be admired by the other inmates -- including an older prisoner named Red -- for his integrity and unquenchable sense of hope.', score=0.82990015)]
+
+Let's embed all the titles now. This will take a while.
+
+```python
+embed_titles()
+```
+
+    CountResult(count=11367)
+
+```python
+client = get_client()
+client.count(collection_name=COLLECTION_NAME)
+```
+
+    CountResult(count=11367)
+
+Now that we we haveour vectors in the collection we need to create a few payload indexes so that we can filter and sort our data using the payload.
+
+We need to create the indexes on the following fields. Different types of indexes support different types of query operations. You can read more about them [here] (https://qdrant.tech/documentation/concepts/indexing/#payload-index)
+
+- Field: vote_average, schema: float
+- Field: type, schema: keyword
+- Field: release_year, schema: integer
+
+Different types of indexes support different types of query operations. You can read more about them [here] (https://qdrant.tech/documentation/concepts/indexing/#payload-index)
+
+- Field: vote_average, schema: float
+- Field: type, schema: keyword
+
+```python
+client = get_client()
+
+indexes = [
+    {"field": "vote_average", "schema": "float"},
+    {"field": "type", "schema": "keyword"},
+    {"field": "release_year", "schema": "integer"},
+
+]
+
+for index in indexes:
+    client.create_payload_index(
+        collection_name=COLLECTION_NAME,
+        field_name=index["field"],
+        field_schema=index["schema"],
+    )
+```
+
+Now that we have embedded all the titles, let's create a simple CLI for our recommendation system. Initially we do not know anything about the user. So we will ask about their preference on the most popular titles.
+
+We will use the `QdrantClient.scroll()` method for that
+
+```python
+from typing import List
+from qdrant_client.http.models import (
+    Direction,
+    Filter,
+    FieldCondition,
+    HasIdCondition,
+    MatchValue,
+    OrderBy,
+    Record,
+    Range
+)
+
+def get_popular_titles(collection_name, ignore_ids=[], release_year_cutoff=1900, limit=10) -> List[Record]:
+    client = get_client()
+    titles = []
+    for title_type in ["movie", "tv"]:
+        response = client.scroll(
+            collection_name=collection_name,
+            order_by=OrderBy(
+                key="vote_average",
+                direction=Direction.DESC,
+            ),
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="type", match=MatchValue(value=title_type)),
+                    FieldCondition(key="release_year", range=Range(gte=release_year_cutoff))
+                ],
+                must_not=[
+                    HasIdCondition(has_id=ignore_ids),
+                ],
+            ),
+            limit=limit//2,
+        )
+
+        titles.extend(response[0])
+    return titles
+```
+
+```python
+get_popular_titles(collection_name=COLLECTION_NAME, release_year_cutoff=1990, limit=20)
+```
+
+    [Record(id=278, payload={'document': 'The Shawshank Redemption is a movie released in 1994 with the following overview - Imprisoned in the 1940s for the double murder of his wife and her lover, upstanding banker Andy Dufresne begins a new life at the Shawshank prison, where he puts his accounting skills to work for an amoral warden. During his long stretch in prison, Dufresne comes to be admired by the other inmates -- including an older prisoner named Red -- for his integrity and unquenchable sense of hope.', 'name': 'The Shawshank Redemption', 'type': 'movie', 'vote_average': 8.705, 'vote_count': 26660, 'release_year': 1994, 'backdrop_path': '/avedvodAZUcwqevBfm8p4G2NziQ.jpg', 'poster_path': '/9cqNxx0GxF0bflZmeSMuL5tnGzr.jpg'}, vector=None, shard_key=None, order_value=8.705),
+     Record(id=129, payload={'document': 'Spirited Away is a movie released in 2001 with the following overview - A young girl, Chihiro, becomes trapped in a strange new world of spirits. When her parents undergo a mysterious transformation, she must call upon the courage she never knew she had to free her family.', 'name': 'Spirited Away', 'type': 'movie', 'vote_average': 8.537, 'vote_count': 16225, 'release_year': 2001, 'backdrop_path': '/m4TUa2ciEWSlk37rOsjiSIvZDXE.jpg', 'poster_path': '/39wmItIWsg5sZMyRUHLkWBcuVCM.jpg'}, vector=None, shard_key=None, order_value=8.537),
+     Record(id=19404, payload={'document': 'Dilwale Dulhania Le Jayenge is a movie released in 1995 with the following overview - Raj is a rich, carefree, happy-go-lucky second generation NRI. Simran is the daughter of Chaudhary Baldev Singh, who in spite of being an NRI is very strict about adherence to Indian values. Simran has left for India to be married to her childhood fiancé. Raj leaves for India with a mission at his hands, to claim his lady love under the noses of her whole family. Thus begins a saga.', 'name': 'Dilwale Dulhania Le Jayenge', 'type': 'movie', 'vote_average': 8.534, 'vote_count': 4413, 'release_year': 1995, 'backdrop_path': '/90ez6ArvpO8bvpyIngBuwXOqJm5.jpg', 'poster_path': '/lfRkUr7DYdHldAqi3PwdQGBRBPM.jpg'}, vector=None, shard_key=None, order_value=8.534),
+     Record(id=496243, payload={'document': "Parasite is a movie released in 2019 with the following overview - All unemployed, Ki-taek's family takes peculiar interest in the wealthy and glamorous Parks for their livelihood until they get entangled in an unexpected incident.", 'name': 'Parasite', 'type': 'movie', 'vote_average': 8.507, 'vote_count': 17904, 'release_year': 2019, 'backdrop_path': '/8eihUxjQsJ7WvGySkVMC0EwbPAD.jpg', 'poster_path': '/7IiTTgloJzvGI1TAYymCfbfl3vT.jpg'}, vector=None, shard_key=None, order_value=8.507),
+     Record(id=497, payload={'document': "The Green Mile is a movie released in 1999 with the following overview - A supernatural tale set on death row in a Southern prison, where gentle giant John Coffey possesses the mysterious power to heal people's ailments. When the cell block's head guard, Paul Edgecomb, recognizes Coffey's miraculous gift, he tries desperately to help stave off the condemned man's execution.", 'name': 'The Green Mile', 'type': 'movie', 'vote_average': 8.506, 'vote_count': 17104, 'release_year': 1999, 'backdrop_path': '/vxJ08SvwomfKbpboCWynC3uqUg4.jpg', 'poster_path': '/8VG8fDNiy50H4FedGwdSVUPoaJe.jpg'}, vector=None, shard_key=None, order_value=8.506),
+     Record(id=667257, payload={'document': 'Impossible Things is a movie released in 2021 with the following overview - After the death of her abusive husband, Matilde finds her new best friend in Miguel, her young, insecure, and disoriented neighbor.', 'name': 'Impossible Things', 'type': 'movie', 'vote_average': 8.5, 'vote_count': 380, 'release_year': 2021, 'backdrop_path': '/bxSBOAD8AuMHYMdW3jso9npAkgt.jpg', 'poster_path': '/t2Ew8NZ8Ci2kqmoecZUNQUFDJnQ.jpg'}, vector=None, shard_key=None, order_value=8.5),
+     Record(id=680, payload={'document': "Pulp Fiction is a movie released in 1994 with the following overview - A burger-loving hit man, his philosophical partner, a drug-addled gangster's moll and a washed-up boxer converge in this sprawling, comedic crime caper. Their adventures unfurl in three stories that ingeniously trip back and forth in time.", 'name': 'Pulp Fiction', 'type': 'movie', 'vote_average': 8.488, 'vote_count': 27517, 'release_year': 1994, 'backdrop_path': '/suaEOtk1N1sgg2MTM7oZd2cfVp3.jpg', 'poster_path': '/d5iIlFn5s0ImszYzBPb8JPIfbXD.jpg'}, vector=None, shard_key=None, order_value=8.488),
+     Record(id=372058, payload={'document': 'Your Name. is a movie released in 2016 with the following overview - High schoolers Mitsuha and Taki are complete strangers living separate lives. But one night, they suddenly switch places. Mitsuha wakes up in Taki’s body, and he in hers. This bizarre occurrence continues to happen randomly, and the two must adjust their lives around each other.', 'name': 'Your Name.', 'type': 'movie', 'vote_average': 8.488, 'vote_count': 11189, 'release_year': 2016, 'backdrop_path': '/dIWwZW7dJJtqC6CgWzYkNVKIUm8.jpg', 'poster_path': '/q719jXXEzOoYaps6babgKnONONX.jpg'}, vector=None, shard_key=None, order_value=8.488),
+     Record(id=122, payload={'document': 'The Lord of the Rings: The Return of the King is a movie released in 2003 with the following overview - As armies mass for a final battle that will decide the fate of the world--and powerful, ancient forces of Light and Dark compete to determine the outcome--one member of the Fellowship of the Ring is revealed as the noble heir to the throne of the Kings of Men. Yet, the sole hope for triumph over evil lies with a brave hobbit, Frodo, who, accompanied by his loyal friend Sam and the hideous, wretched Gollum, ventures deep into the very dark heart of Mordor on his seemingly impossible quest to destroy the Ring of Power.\u200b', 'name': 'The Lord of the Rings: The Return of the King', 'type': 'movie', 'vote_average': 8.481, 'vote_count': 23781, 'release_year': 2003, 'backdrop_path': '/2u7zbn8EudG6kLlBzUYqP8RyFU4.jpg', 'poster_path': '/rCzpDGLbOoPwLjy3OAm5NUPOTrC.jpg'}, vector=None, shard_key=None, order_value=8.481),
+     Record(id=13, payload={'document': 'Forrest Gump is a movie released in 1994 with the following overview - A man with a low IQ has accomplished great things in his life and been present during significant historic events—in each case, far exceeding what anyone imagined he could do. But despite all he has achieved, his one true love eludes him.', 'name': 'Forrest Gump', 'type': 'movie', 'vote_average': 8.474, 'vote_count': 27032, 'release_year': 1994, 'backdrop_path': '/ghgfzbEV7kbpbi1O8eIILKVXEA8.jpg', 'poster_path': '/arw2vcBveWOVZr6pxd9XTd1TdQa.jpg'}, vector=None, shard_key=None, order_value=8.474),
+     Record(id=1396, payload={'document': "Breaking Bad is a tv series released in 2008 with the following overview - Walter White, a New Mexico chemistry teacher, is diagnosed with Stage III cancer and given a prognosis of only two years left to live. He becomes filled with a sense of fearlessness and an unrelenting desire to secure his family's financial future at any cost as he enters the dangerous world of drugs and crime.", 'name': 'Breaking Bad', 'type': 'tv', 'vote_average': 8.913, 'vote_count': 14017, 'release_year': 2008, 'backdrop_path': '/9faGSFi5jam6pDWGNd0p8JcJgXQ.jpg', 'poster_path': '/ztkUQFLlC19CCMYHW9o1zWhJRNq.jpg'}, vector=None, shard_key=None, order_value=8.913),
+     Record(id=94954, payload={'document': "Hazbin Hotel is a tv series released in 2024 with the following overview - In attempt to find a non-violent alternative for reducing Hell's overpopulation, the daughter of Lucifer opens a rehabilitation hotel that offers a group of misfit demons a chance at redemption.", 'name': 'Hazbin Hotel', 'type': 'tv', 'vote_average': 8.9, 'vote_count': 1047, 'release_year': 2024, 'backdrop_path': '/9kyyQXy79YRdY5mhrYKyktbFMev.jpg', 'poster_path': '/rXojaQcxVUubPLSrFV8PD4xdjrs.jpg'}, vector=None, shard_key=None, order_value=8.9),
+     Record(id=209867, payload={'document': "Frieren: Beyond Journey's End is a tv series released in 2023 with the following overview - After the party of heroes defeated the Demon King, they restored peace to the land and returned to lives of solitude. Generations pass, and the elven mage Frieren comes face to face with humanity’s mortality. She takes on a new apprentice and promises to fulfill old friends’ dying wishes. Can an elven mind make peace with the nature of life and death? Frieren embarks on her quest to find out.", 'name': "Frieren: Beyond Journey's End", 'type': 'tv', 'vote_average': 8.897, 'vote_count': 248, 'release_year': 2023, 'backdrop_path': '/96RT2A47UdzWlUfvIERFyBsLhL2.jpg', 'poster_path': '/dqZENchTd7lp5zht7BdlqM7RBhD.jpg'}, vector=None, shard_key=None, order_value=8.897),
+     Record(id=94605, payload={'document': 'Arcane is a tv series released in 2021 with the following overview - Amid the stark discord of twin cities Piltover and Zaun, two sisters fight on rival sides of a war between magic technologies and clashing convictions.', 'name': 'Arcane', 'type': 'tv', 'vote_average': 8.748, 'vote_count': 3916, 'release_year': 2021, 'backdrop_path': '/rkB4LyZHo1NHXFEDHl9vSD9r1lI.jpg', 'poster_path': '/fqldf2t8ztc9aiwn3k6mlX3tvRT.jpg'}, vector=None, shard_key=None, order_value=8.748),
+     Record(id=37854, payload={'document': 'One Piece is a tv series released in 1999 with the following overview - Years ago, the fearsome Pirate King, Gol D. Roger was executed leaving a huge pile of treasure and the famous "One Piece" behind. Whoever claims the "One Piece" will be named the new King of the Pirates.\n\nMonkey D. Luffy, a boy who consumed a "Devil Fruit," decides to follow in the footsteps of his idol, the pirate Shanks, and find the One Piece. It helps, of course, that his body has the properties of rubber and that he\'s surrounded by a bevy of skilled fighters and thieves to help him along the way.\n\nLuffy will do anything to get the One Piece and become King of the Pirates!', 'name': 'One Piece', 'type': 'tv', 'vote_average': 8.7, 'vote_count': 4566, 'release_year': 1999, 'backdrop_path': '/2rmK7mnchw9Xr3XdiTFSxTTLXqv.jpg', 'poster_path': '/e3NBGiAifW9Xt8xD5tpARskjccO.jpg'}, vector=None, shard_key=None, order_value=8.7),
+     Record(id=42705, payload={'document': "Fighting Spirit is a tv series released in 2000 with the following overview - Makunouchi Ippo is an ordinary high school student in Japan. Since he spends most of his time away from school helping his mother run the family business, he doesn't get to enjoy his younger years like most teenagers. Always a target for bullying at school (the family fishing business grants him a distinct odor), Ippo's life is one of hardship. One of these after-school bullying sessions turns Ippo's life around for the better, as he is saved by a boxer named Takamura. He decides to follow in Takamura's footsteps and train to become a boxer, giving his life direction and purpose. Ippo's path to perfecting his pugilistic prowess is just beginning...", 'name': 'Fighting Spirit', 'type': 'tv', 'vote_average': 8.7, 'vote_count': 1022, 'release_year': 2000, 'backdrop_path': '/2w8FaLwwJTWr6ExUMeVgT2Th5YT.jpg', 'poster_path': '/i3U3J2MWovIBZBnZYYiOLBXqNJZ.jpg'}, vector=None, shard_key=None, order_value=8.7),
+     Record(id=85937, payload={'document': 'Demon Slayer: Kimetsu no Yaiba is a tv series released in 2019 with the following overview - It is the Taisho Period in Japan. Tanjiro, a kindhearted boy who sells charcoal for a living, finds his family slaughtered by a demon. To make matters worse, his younger sister Nezuko, the sole survivor, has been transformed into a demon herself. Though devastated by this grim reality, Tanjiro resolves to become a “demon slayer” so that he can turn his sister back into a human, and kill the demon that massacred his family.', 'name': 'Demon Slayer: Kimetsu no Yaiba', 'type': 'tv', 'vote_average': 8.7, 'vote_count': 6318, 'release_year': 2019, 'backdrop_path': '/3GQKYh6Trm8pxd2AypovoYQf4Ay.jpg', 'poster_path': '/xUfRZu2mi8jH6SzQEJGP6tjBuYj.jpg'}, vector=None, shard_key=None, order_value=8.7),
+     Record(id=31911, payload={'document': 'Fullmetal Alchemist: Brotherhood is a tv series released in 2009 with the following overview - Disregard for alchemy’s laws ripped half of Edward Elric’s limbs from his body and left his brother Alphonse’s soul clinging to a suit of armor. To restore what was lost, the brothers seek the Philosopher’s Stone. Enemies and allies – the corrupt military, the Homunculi, and foreign alchemists – will alter the Elric brothers course, but their purpose will remain unchanged and their bond unbreakable.', 'name': 'Fullmetal Alchemist: Brotherhood', 'type': 'tv', 'vote_average': 8.7, 'vote_count': 1994, 'release_year': 2009, 'backdrop_path': '/A6tMQAo6t6eRFCPhsrShmxZLqFB.jpg', 'poster_path': '/8H4ej2NpujYVBPsW2smmzC8d2xU.jpg'}, vector=None, shard_key=None, order_value=8.7),
+     Record(id=246, payload={'document': 'Avatar: The Last Airbender is a tv series released in 2005 with the following overview - In a war-torn world of elemental magic, a young boy reawakens to undertake a dangerous mystic quest to fulfill his destiny as the Avatar, and bring peace to the world.', 'name': 'Avatar: The Last Airbender', 'type': 'tv', 'vote_average': 8.7, 'vote_count': 4026, 'release_year': 2005, 'backdrop_path': '/kU98MbVVgi72wzceyrEbClZmMFe.jpg', 'poster_path': '/cHFZA8Tlv03nKTGXhLOYOLtqoSm.jpg'}, vector=None, shard_key=None, order_value=8.7),
+     Record(id=1429, payload={'document': 'Attack on Titan is a tv series released in 2013 with the following overview - Many years ago, the last remnants of humanity were forced to retreat behind the towering walls of a fortified city to escape the massive, man-eating Titans that roamed the land outside their fortress. Only the heroic members of the Scouting Legion dared to stray beyond the safety of the walls – but even those brave warriors seldom returned alive. Those within the city clung to the illusion of a peaceful existence until the day that dream was shattered, and their slim chance at survival was reduced to one horrifying choice: kill – or be devoured!', 'name': 'Attack on Titan', 'type': 'tv', 'vote_average': 8.7, 'vote_count': 6233, 'release_year': 2013, 'backdrop_path': '/rqbCbjB19amtOtFQbb3K2lgm2zv.jpg', 'poster_path': '/hTP1DtLGFamjfu8WqjnuQdP1n4i.jpg'}, vector=None, shard_key=None, order_value=8.7)]
+
+We are fetching the top 20 movies and tv series. Once we have some likes and dislikes we will use Qdrant's recommend API to get more directed results.
+
+Let's now define a class that can store the user's choices.
+
+```python
+class User:
+    def __init__(self):
+        self._likes = set()
+        self._dislikes = set()
+        self._not_watched = set()
+        self._recommendations = set()
+
+    def discard(self, id):
+        self._likes.discard(id)
+        self._dislikes.discard(id)
+        self._not_watched.discard(id)
+        self._recommendations.discard(id)
+
+    def like(self, id):
+        self.discard(id)
+        self._likes.add(id)
+
+    def dislike(self, id):
+        self.discard(id)
+        self._dislikes.add(id)
+
+    def not_watched(self, id, recommended=False):
+        self.discard(id)
+        self._not_watched.add(id)
+        if recommended:
+            self._recommendations.add(id)
+
+    def get_likes(self):
+        return list(self._likes)
+
+    def get_dislikes(self):
+        return list(self._dislikes)
+
+    def get_not_watched(self):
+        return list(self._not_watched)
+
+    def get_recommendations(self):
+        return list(self._recommendations)
+
+    def __repr__(self):
+        return ("User::\n" +
+            f"Likes: [{', '.join(map(str, self._likes))}] \n" +
+            f"Dislikes: [{', '.join(map(str, self._dislikes))}] \n" +
+            f"Not Watched: [{', '.join(map(str, self._not_watched))}] \n" +
+            f"Recommendations: [{', '.join(map(str, self._recommendations))}]>")
+
+```
+
+Now we are all set to create a widget that can ask for the user's preferences. We will be using ipywidget for this purpose. We will create a widget and attach event listeners on the buttons.
+
+```python
+import ipywidgets as widgets
+
+def create_prompt_widget_for_title(title, user: User, recommended: bool):
+    # Create the UI
+    base_img_url = "https://image.tmdb.org/t/p/w300"
+    poster = widgets.Image.from_url(url=f'{base_img_url}{title["poster_path"]}', width=300)
+    released = f'({title.get("release_year")})' if title.get("release_year") is not None else ''
+    name = widgets.HTML(value=f'<h1>{title["name"]} {released}</h1>')
+    tmdb_rating = widgets.HTML(value=f'<b>TMDB Rating: {title["vote_average"]} ({title["vote_count"]} ratings)</b>')
+    overview = widgets.HTML(value=title["overview"])
+    notice = widgets.HTML(value="This widget will disappear once you click on any of the buttons")
+
+    # Create the action buttons
+    like_button = widgets.Button(
+        description='Like',
+        disabled=False,
+        button_style='Success',
+        tooltip='Like',
+        icon='check'
+    )
+    dislike_button = widgets.Button(
+        description='Dislike',
+        disabled=False,
+        button_style='danger',
+        tooltip='Dislike',
+        icon='cross'
+    )
+    not_watched_button = widgets.Button(
+        description='Not Watched',
+        disabled=False,
+        button_style='',
+        tooltip='Not Watched',
+        icon='check',
+    )
+    buttons = widgets.HBox([like_button, not_watched_button, dislike_button])
+    details = widgets.VBox([name, tmdb_rating, overview, buttons, notice], layout=widgets.Layout(padding='20px'))
+
+    widget = widgets.HBox([poster, details], layout=widgets.Layout(padding='5px', margin='10px'))
+
+    # Setup the event handlers for the action buttons
+    def like_handler(_):
+        user.like(title["id"])
+        widget.close()
+
+    def dislike_handler(_):
+        user.dislike(title["id"])
+        widget.close()
+
+    def not_watched_handler(_):
+        user.not_watched(title["id"], recommended)
+        widget.close()
+
+    # Wire 'em up.
+    like_button.on_click(like_handler)
+    dislike_button.on_click(dislike_handler)
+    not_watched_button.on_click(not_watched_handler)
+
+    return widget
+
+```
+
+Here is what a prompt would look like
+
+```python
+titles = load_titles_from_disk()
+title = titles[0]
+user = User()
+create_prompt_widget_for_title(title, user=user, recommended=True)
+```
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/9cqNxx0G...', format='url', width='300'), VBox(ch…
+
+Click a button to save your preference. The object of the User class will hold our preferences for future use.
+
+```python
+# The user object holds our preferences
+
+user
+```
+
+    User::
+    Likes: []
+    Dislikes: []
+    Not Watched: []
+    Recommendations: []>
+
+We can now create a function to understand the user's likes and dislikes. We will fetch top 10 movies and tv shows and ask for our user's opinion on them.
+
+```python
+def run_recommendation_loop(user: User):
+    results = get_popular_titles(COLLECTION_NAME, user.get_likes() + user.get_dislikes() + user.get_not_watched(), release_year_cutoff=1995, limit=10)
+    for result in results:
+        title = {
+            "id": result.id,
+            "overview": result.payload["document"],
+            **result.payload
+        }
+        widget = create_prompt_widget_for_title(title, recommended=False, user=user)
+        display(widget)
+
+    return user
+```
+
+```python
+user = User()
+
+user = run_recommendation_loop(user)
+```
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/39wmItIW...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/lfRkUr7D...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/7IiTTglo...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/8VG8fDNi...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/t2Ew8NZ8...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/ztkUQFLl...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/rXojaQcx...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/dqZENchT...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/fqldf2t8...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/e3NBGiAi...', format='url', width='300'), VBox(ch…
+
+
+    False
+    False
+
+We can see that the choices have been saved for our user.
+
+```python
+user
+```
+
+    User::
+    Likes: [497, 1396, 94605]
+    Dislikes: [94954, 209867, 19404, 667257, 37854]
+    Not Watched: [129, 496243]
+    Recommendations: []>
+
+We know a bit about the user now. We can now create a method to get recommendations using Qdrant's client.recommend() API.
+
+## Get Recommendations
+
+```python
+from qdrant_client.http.models import RecommendStrategy, Range
+
+def get_recommended_titles(collection_name, positive_ids=[], negative_ids=[], ignore_ids=[], release_year_cutoff=1900, limit=10):
+    return client.recommend(
+        collection_name=collection_name,
+        positive=positive_ids,
+        negative=negative_ids,
+        query_filter=Filter(
+            must=[
+                    FieldCondition(key="vote_average", range=Range(gte=8)),
+                    FieldCondition(key="release_year", range=Range(gte=release_year_cutoff))
+                ],
+            must_not=[
+                HasIdCondition(has_id=positive_ids + negative_ids + ignore_ids),
+            ],
+        ),
+        strategy=RecommendStrategy.AVERAGE_VECTOR,
+        # We need to pass in the name of the vector field. This is name is defined in the fastembed config and
+        # is choosen on the basis of our embedding model.
+        using="fast-bge-small-en",
+        limit=limit,
+    )
+```
+
+We can update our recommendation loop function to choose between popular and recommended titles.
+
+```python
+def run_recommendation_loop(user: User):
+    recommended = False
+    release_year_cutoff = 1990
+    if len(user.get_likes()) < 10:
+        # If we have less than 10 likes don't try to get recommendations. Just get most popular titles
+        results = get_popular_titles(
+            collection_name=COLLECTION_NAME,
+            ignore_ids=user.get_likes() + user.get_dislikes() + user.get_not_watched(),
+            release_year_cutoff=release_year_cutoff,
+            limit=10)
+    else:
+        recommended = True
+        results = get_recommended_titles(
+            collection_name=COLLECTION_NAME,
+            positive_ids=user.get_likes(),
+            negative_ids=user.get_dislikes(),
+            ignore_ids=user.get_not_watched(),
+            release_year_cutoff=release_year_cutoff,
+            limit=10)
+    for result in results:
+        title = {
+            "id": result.id,
+            "overview": result.payload["document"],
+            **result.payload
+        }
+        # Create and display prompt widgets for all titles
+        widget = create_prompt_widget_for_title(title, recommended=recommended, user=user)
+        display(widget)
+
+    return user
+```
+
+```python
+user = User()
+
+user = run_recommendation_loop(user)
+```
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/9cqNxx0G...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/39wmItIW...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/lfRkUr7D...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/7IiTTglo...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/8VG8fDNi...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/ztkUQFLl...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/rXojaQcx...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/dqZENchT...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/fqldf2t8...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/e3NBGiAi...', format='url', width='300'), VBox(ch…
+
+Let's run the recommendation loop a few more times to collect more preferences.
+
+```python
+user = run_recommendation_loop(user)
+```
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/7sfbEnaA...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/zSqJ1qFq...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/8Gxv8gSF...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/8JMXquNm...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/5M0j0B18...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/xSDdRAjx...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/rWbsxdwF...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/bABCBKYB...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/nOd6vjEm...', format='url', width='300'), VBox(ch…
+
+
+
+    HBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/nWtySDlf...', format='url', width='300'), VBox(ch…
+
+Now that we have collected enough preferences let's create a widget that will list out all the recommendations.
+
+```python
+def create_display_widget_for_title(title, width):
+    base_img_url = "https://image.tmdb.org/t/p/w300"
+
+    html = f'<b>{title["name"]}</b><br />'
+    html += f'<b>TMDB Rating: {title["vote_average"]} ({title["vote_count"]} ratings)</b>'
+    if title.get("release_year") is not None:
+        html += f'<br />Released: {title.get("release_year")}'
+    html = f'<div style="padding: 10px; background-color: #eee; width: {width}">{html}</div>'
+    poster = widgets.Image.from_url(url=f'{base_img_url}{title["poster_path"]}', width=300)
+    details = widgets.HTML(value=html)
+
+    widget = widgets.VBox([poster, details])
+    return widget
+
+def find_by_title_id(title_id):
+    titles = load_titles_from_disk()
+    return next(title for title in titles if title["id"] == title_id)
+
+def show_recommendations(user: User):
+    width = "300px"
+    recommendations = user.get_recommendations()
+    if len(recommendations) == 0:
+        print("we don't have any recommendations yet. Run the loop a few time to get some recommendations")
+    title_widgets = [create_display_widget_for_title(find_by_title_id(title), width) for title in recommendations]
+    return widgets.GridBox(title_widgets, layout=widgets.Layout(grid_template_columns=f"repeat(3, {width})", flex="flex", justify_content="center", grid_gap="10px", padding="20px"))
+
+```
+
+```python
+# Call the show_recommendations function to list all the recommendations so far.
+show_recommendations(user)
+```
+
+    GridBox(children=(VBox(children=(Image(value=b'https://image.tmdb.org/t/p/w300/8JMXquNm...', format='url', wid…
+
+# Next steps
+
+Right now we are using the default and the most light weight model to generate our embeddings. The results that we are getting a okay but certainly can be a lot better. The next step would be try out some of the available models and see which one gives the best result. Another thing to do would be to use a movie reviews dataset and use that to get better recommendations
+
+But that is something for another day.
+
+# Summary
+
+In this notebook we learned about
+
+- [Vector Embeddings]()
+- [Qdrant DB](https://qdrant.tech/)
+- [Fastembed](https://qdrant.github.io/fastembed/)
+- [QdrantClient.add()](https://qdrant.tech/documentation/fastembed/fastembed-semantic-search/#using-fastembed-with-qdrant-for-vector-search)
+- [QdrantClient.scroll()](https://qdrant.tech/documentation/concepts/points/#scroll-points)
+- [QdrantClient.recommend()](https://qdrant.tech/documentation/concepts/explore/#recommendation-api)
+- [TMDB API](https://developer.themoviedb.org/reference/intro/getting-started)
+- [ipywidgets](https://ipywidgets.readthedocs.io/en/stable/)
+
+# Footnotes
+
+- We could have installed and imported all the libraries at the top of the file. But in my opinion doing it just in time makes more sense for jupyter notebooks. Although it does increase the work if you want to move the code to a proper project.

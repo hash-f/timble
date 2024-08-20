@@ -1,1 +1,7 @@
+data/
+db/
 venv/
+notebooks/data
+notebooks/db
+notebooks/.ipynb_checkpoints
+.env
